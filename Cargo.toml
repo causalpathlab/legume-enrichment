@@ -1,0 +1,36 @@
+[package]
+name = "legume-enrichment"
+version = "0.3.9"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+authors = ["Yongjin Park <ypp@stat.ubc.ca> <yongjin.park@ubc.ca>"]
+description = "Gene-set enrichment, ontology scoring, and marker bootstrap for single-cell annotation"
+repository = "https://github.com/causalpathlab/legume-enrichment"
+homepage = "https://github.com/causalpathlab/legume-enrichment"
+readme = "README.md"
+keywords = ["genomics", "single-cell", "enrichment", "ontology"]
+categories = ["science"]
+exclude = [
+    "**/.claude/**",
+    "**/.DS_Store",
+]
+
+[lib]
+name = "enrichment"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+
+nalgebra = "0.34"
+rand = "0.10.1"
+rayon = "1.10.0"
+rustc-hash = "2.1"
+indicatif = { version = "^0.18", features = ["rayon"] }
+special = "0.13"
+statrs = { version = "0.18", default-features = false }
+
+legume-numeric = { version = "0.8.10", features = ["matrix"] }
