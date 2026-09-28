@@ -123,7 +123,9 @@ fn multilevel_resolves_planted_types_below_the_draws_floor() {
             "multilevel p[{d},{d}] = {} not below the draws' floor {floor}",
             ml.pvalue_kc[(d, d)]
         );
-        assert!(ml.p_log2err_kc[(d, d)] > 0.0);
+        // A finite error, or NaN where the planted set is so extreme the p is only a bound.
+        let err = ml.p_log2err_kc[(d, d)];
+        assert!(err > 0.0 || err.is_nan(), "log2err[{d},{d}] = {err}");
         assert!(
             ml.nes_kc[(d, d)] > 1.0,
             "NES[{d},{d}] = {}",
