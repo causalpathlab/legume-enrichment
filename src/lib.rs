@@ -3,14 +3,18 @@
 //!
 //! Given a group × gene profile matrix (topics' β, cluster centroids, SVD
 //! loadings) and a marker-gene membership matrix (gene × celltype), compute a
-//! K × C significance table via GSEA-style weighted KS enrichment scores with
-//! Efron–Tibshirani restandardization against a pseudobulk-level permutation
-//! null. The FDR-sparse Q matrix is a portable "celltype lens" — swap marker
-//! DBs, recompute Q; train β once, annotate any dataset via θ · Q.
+//! K × C significance table via GSEA-style weighted KS enrichment scores:
+//! fgsea's normalized score (NES) and sign-aware / multilevel p-value against an
+//! abundance-matched gene-set null ([`fgsea`]), or a pooled pseudobulk-level
+//! permutation null on the Efron–Tibshirani restandardized score, adjusted by
+//! BH or TreeBH over a cell-type tree ([`treebh`]). The FDR-sparse Q matrix is a
+//! portable "celltype lens" — swap marker DBs, recompute Q; train β once,
+//! annotate any dataset via θ · Q.
 
 pub mod cellproj;
 pub mod consensus;
 pub mod es;
+pub mod fgsea;
 pub mod gene_strata;
 pub mod marker_bootstrap;
 pub mod markers;

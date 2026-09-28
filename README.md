@@ -7,7 +7,7 @@ spatial annotation. Extracted from
 The Rust library crate is named `enrichment`:
 
 ```toml
-enrichment = { version = "0.3.9", package = "legume-enrichment" }
+enrichment = { version = "0.4.0", package = "legume-enrichment" }
 ```
 
 ```sh

@@ -123,6 +123,18 @@ impl GeneStrata {
         self.members.len()
     }
 
+    /// The bin gene `g` falls in.
+    #[must_use]
+    pub fn stratum_of(&self, g: u32) -> usize {
+        self.stratum[g as usize]
+    }
+
+    /// The genes in bin `s`.
+    #[must_use]
+    pub fn members(&self, s: usize) -> &[u32] {
+        &self.members[s]
+    }
+
     /// A panel's **stratum profile**: `out[s]` holds the weights of the panel's genes that fall in
     /// bin `s`. This is what a null draw must reproduce — both the per-bin *counts* (so abundance
     /// cancels) and the *weights* those genes carried (so the walk's mass distribution does too).
