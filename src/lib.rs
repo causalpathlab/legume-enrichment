@@ -42,7 +42,10 @@ pub use ontology::{
     annotate_ontology_core, parse_label_map, OntologyAccess, OntologyParams, OntologyScore,
 };
 pub use ontology_enrich::{ontology_module_score, OntologyModuleScore};
-pub use orchestrate::{annotate, AnnotateConfig, AnnotateOutputs, GroupInputs};
+pub use orchestrate::{
+    adjust, annotate, annotate_types, live_types, Adjusted, AnnotateConfig, AnnotateOutputs,
+    GroupInputs, TypeScores,
+};
 pub use specificity::{compute_specificity, SpecificityMode};
 
 pub type Mat = nalgebra::DMatrix<f32>;

@@ -242,10 +242,254 @@ pub fn annotate(
     celltype_names: &[Box<str>],
     config: &AnnotateConfig,
 ) -> anyhow::Result<AnnotateOutputs> {
+    let Scores {
+        es_obs,
+        es_obs_std,
+        nes,
+        perm_z_kc,
+        pvalue,
+        p_log2err,
+        ranked_per_k,
+        strata,
+        pooled_null,
+    } = score(inputs, markers_gc, celltype_names, config, None)?;
+    let Adjusted {
+        pvalue_kc: pvalue,
+        qvalue_kc: qvalue,
+        z_kc: z,
+        q_kc: q_mat,
+    } = adjust(&pvalue, markers_gc, config)?;
+
+    // Cell-level posterior + labels — the single-pass point estimate.
+    let (mut posterior, mut labels) = label_cells(
+        &inputs.cell_membership_nk,
+        &q_mat,
+        &inputs.cell_names,
+        celltype_names,
+        config.min_confidence,
+    );
+
+    // The stability bootstrap. When it runs, its consensus REPLACES the point estimate above: a
+    // cluster whose call cannot survive resampling of its own marker panel should not ship that
+    // call with a softmaxed `confidence` of 0.98 beside it.
+    let bootstrap = match config.bootstrap.as_ref() {
+        None => None,
+        Some(bcfg) => {
+            let boot = run_cluster_bootstrap(
+                &ranked_per_k,
+                markers_gc,
+                &strata,
+                &pooled_null,
+                markers_gc.nrows(),
+                config.fdr_alpha,
+                config.q_softmax_temperature,
+                config.seed,
+                bcfg,
+            )?;
+            let (bp, bl) = broadcast_to_cells(
+                &boot,
+                &inputs.cell_membership_nk,
+                &inputs.cell_names,
+                celltype_names,
+                &q_mat,
+            );
+            posterior = bp;
+            labels = bl;
+            Some(boot)
+        }
+    };
+
+    Ok(AnnotateOutputs {
+        q_kc: q_mat,
+        es_kc: es_obs,
+        es_restandardized_kc: es_obs_std,
+        nes_kc: nes,
+        z_kc: z,
+        perm_z_kc,
+        pvalue_kc: pvalue,
+        p_log2err_kc: p_log2err,
+        qvalue_kc: qvalue,
+        cell_annotation_nc: posterior,
+        argmax_labels: labels,
+        bootstrap,
+    })
+}
+
+/// One subset of the panel's cell types scored as [`annotate`] scores them: per topic × type in
+/// `types` (columns in that order), the ES, restandardized ES, NES, p-value and its `log2err`.
+///
+/// Both nulls are drawn only for those types, with the seeds [`annotate`] uses, so each column
+/// is the column `annotate` gives on the same inputs, in a fraction of the time when `types` is
+/// a few of many. The sample-permutation null still re-ranks every topic (its pool spans them
+/// all). What is left out is what needs every type: the q-values and Q, which [`adjust`] gives
+/// once the other types' p-values are known, e.g. from an earlier run over an unedited panel.
+pub fn annotate_types(
+    inputs: &GroupInputs,
+    markers_gc: &Mat,
+    celltype_names: &[Box<str>],
+    config: &AnnotateConfig,
+    types: &[usize],
+) -> anyhow::Result<TypeScores> {
+    let c = markers_gc.ncols();
+    anyhow::ensure!(
+        types.iter().all(|&t| t < c),
+        "a type index is out of range of the {c} types"
+    );
+    let mut only = vec![false; c];
+    for &t in types {
+        only[t] = true;
+    }
+    let s = score(inputs, markers_gc, celltype_names, config, Some(&only))?;
+    Ok(TypeScores {
+        types: types.to_vec(),
+        es_kc: s.es_obs.select_columns(types),
+        es_restandardized_kc: s.es_obs_std.select_columns(types),
+        nes_kc: s.nes.select_columns(types),
+        pvalue_kc: s.pvalue.select_columns(types),
+        p_log2err_kc: s.p_log2err.select_columns(types),
+    })
+}
+
+/// [`annotate_types`]' scores: topics × the chosen types, in the order asked.
+pub struct TypeScores {
+    pub types: Vec<usize>,
+    pub es_kc: Mat,
+    pub es_restandardized_kc: Mat,
+    pub nes_kc: Mat,
+    pub pvalue_kc: Mat,
+    pub p_log2err_kc: Mat,
+}
+
+/// The FDR and Q step of [`annotate`] on topic × type p-values: types without a live panel
+/// (see [`live_types`]) set to p = 1 and left out of every family, then per topic row BH, or
+/// TreeBH over `config.type_tree`, and Q, the softmax of z = Φ⁻¹(1 − p) over the calls at
+/// q < `fdr_alpha`.
+pub fn adjust(
+    pvalue_kc: &Mat,
+    markers_gc: &Mat,
+    config: &AnnotateConfig,
+) -> anyhow::Result<Adjusted> {
+    let (k, c) = (pvalue_kc.nrows(), pvalue_kc.ncols());
+    anyhow::ensure!(
+        markers_gc.ncols() == c,
+        "p-values and markers disagree on the types"
+    );
+    let tested = live_types(markers_gc, config);
+    let type_tree = config
+        .type_tree
+        .as_ref()
+        .map(|t| {
+            t.completed(&tested)
+                .map(|(children, leaf)| (t.root, children, leaf))
+        })
+        .transpose()?;
+    // Only the cell types with a live panel are hypotheses: a type dropped by `min_markers` gets
+    // p = q = 1 and stays out of every family, or it would enlarge m (and, with a floor p, once
+    // topped every row).
+    let mut pvalue = pvalue_kc.clone();
+    for cc in (0..c).filter(|&cc| !tested[cc]) {
+        pvalue.column_mut(cc).fill(1.0);
+    }
+    let mut qvalue = Mat::from_element(k, c, 1.0);
+    // FDR per topic row, not over all K × C: Q is built per topic (a softmax over a row's calls),
+    // so per-row error control matches its use, and the pooled sample-permutation null shares
+    // values across topics within a type, so a global K × C correction over-corrects.
+    match type_tree.as_ref() {
+        // TreeBH within each topic row: families are the tree's nodes, so a fine type is tested
+        // only where its coarser class is, and FDR holds at every level of the tree at once.
+        Some((root, children, leaf)) => {
+            let rows: Vec<Vec<f64>> = (0..k)
+                .into_par_iter()
+                .map(|kk| {
+                    let mut leaf_p = vec![None; children.len()];
+                    for (cc, l) in leaf.iter().enumerate() {
+                        if let Some(l) = *l {
+                            leaf_p[l] = Some(f64::from(pvalue[(kk, cc)]));
+                        }
+                    }
+                    let q = treebh_q(children, *root, &leaf_p, false);
+                    leaf.iter().map(|l| l.map_or(1.0, |l| q[l])).collect()
+                })
+                .collect();
+            for (kk, row) in rows.iter().enumerate() {
+                for cc in 0..c {
+                    qvalue[(kk, cc)] = row[cc] as f32;
+                }
+            }
+        }
+        None => {
+            let tested_idx: Vec<usize> = (0..c).filter(|&cc| tested[cc]).collect();
+            for kk in 0..k {
+                let row_p: Vec<f32> = tested_idx.iter().map(|&cc| pvalue[(kk, cc)]).collect();
+                let row_q = benjamini_hochberg(&row_p);
+                for (&cc, &q) in tested_idx.iter().zip(&row_q) {
+                    qvalue[(kk, cc)] = q;
+                }
+            }
+        }
+    }
+    let z = probit_z(&pvalue);
+    let q = build_q_matrix(&z, &qvalue, config.fdr_alpha, config.q_softmax_temperature);
+    Ok(Adjusted {
+        pvalue_kc: pvalue,
+        qvalue_kc: qvalue,
+        z_kc: z,
+        q_kc: q,
+    })
+}
+
+/// [`adjust`]'s outputs, as [`AnnotateOutputs`] names them.
+pub struct Adjusted {
+    /// The p-values with the untested types at 1.
+    pub pvalue_kc: Mat,
+    pub qvalue_kc: Mat,
+    pub z_kc: Mat,
+    pub q_kc: Mat,
+}
+
+/// The types that are hypotheses: a panel of at least `max(min_markers, 2)` live markers that is
+/// not the whole gene universe (whose null is degenerate).
+#[must_use]
+pub fn live_types(markers_gc: &Mat, config: &AnnotateConfig) -> Vec<bool> {
+    let (g, bar) = (markers_gc.nrows(), config.min_markers.max(MIN_LIVE_MARKERS));
+    (0..markers_gc.ncols())
+        .map(|cc| {
+            let m = (0..g).filter(|&gi| markers_gc[(gi, cc)] > 0.0).count();
+            m >= bar && m < g
+        })
+        .collect()
+}
+
+/// [`score`]'s per topic × type statistics, and what the bootstrap reuses. Columns `score` was
+/// not asked for are left at zero.
+struct Scores {
+    es_obs: Mat,
+    es_obs_std: Mat,
+    nes: Mat,
+    perm_z_kc: Option<Mat>,
+    pvalue: Mat,
+    p_log2err: Mat,
+    ranked_per_k: Vec<Vec<u32>>,
+    strata: GeneStrata,
+    pooled_null: Vec<Vec<f32>>,
+}
+
+/// [`annotate`]'s scoring stage, up to the p-values: the observed ES and both nulls, drawn only
+/// for the types `only` marks when given.
+fn score(
+    inputs: &GroupInputs,
+    markers_gc: &Mat,
+    celltype_names: &[Box<str>],
+    config: &AnnotateConfig,
+    only: Option<&[bool]>,
+) -> anyhow::Result<Scores> {
     let g = inputs.profile_gk.nrows();
     let k = inputs.profile_gk.ncols();
     let p = inputs.pb_membership_pk.nrows();
     let c = markers_gc.ncols();
+    // The types scored: all, or the subset `annotate_types` asked for.
+    let scored = |cc: usize| only.is_none_or(|o| o[cc]);
+    let want: Vec<usize> = (0..c).filter(|&cc| scored(cc)).collect();
 
     anyhow::ensure!(markers_gc.nrows() == g, "markers G dim mismatch");
     anyhow::ensure!(
@@ -323,15 +567,10 @@ pub fn annotate(
 
     // The hypotheses: types with a live panel that is not the whole gene universe (whose null is
     // degenerate). A malformed type tree fails here, before any null is drawn.
-    let tested: Vec<bool> = marker_sizes.iter().map(|&m| m > 0 && m < g).collect();
-    let type_tree = config
-        .type_tree
-        .as_ref()
-        .map(|t| {
-            t.completed(&tested)
-                .map(|(children, leaf)| (t.root, children, leaf))
-        })
-        .transpose()?;
+    let tested = live_types(markers_gc, config);
+    if let Some(t) = &config.type_tree {
+        t.completed(&tested)?;
+    }
 
     // Observed specificity and ranked orderings per topic.
     let specificity_obs = compute_specificity(&inputs.profile_gk, config.specificity);
@@ -345,7 +584,7 @@ pub fn annotate(
     // Observed ES (K × C). IDF-weighted hits via hit_weights[c].
     let mut es_obs = Mat::zeros(k, c);
     for kk in 0..k {
-        for cc in 0..c {
+        for &cc in &want {
             es_obs[(kk, cc)] = weighted_ks_es(&ranked_per_k[kk], &hit_weights[cc]);
         }
     }
@@ -400,7 +639,7 @@ pub fn annotate(
         .map(|cc| {
             let m_size = marker_sizes[cc];
             let mut tails = vec![NullTail::default(); k];
-            if !tested[cc] {
+            if !tested[cc] || !scored(cc) {
                 return tails;
             }
             let mut rng = SmallRng::seed_from_u64(
@@ -492,6 +731,7 @@ pub fn annotate(
                 .flat_map(|cc| (0..k).map(move |kk| (kk, cc)))
                 .filter(|&(kk, cc)| {
                     tested[cc]
+                        && scored(cc)
                         && es_obs[(kk, cc)] > 0.0
                         && row_stats[cc][kk].n_ge < MULTILEVEL_BELOW
                 })
@@ -549,7 +789,7 @@ pub fn annotate(
                 for kk in 0..k {
                     let scores: Vec<f32> = (0..g).map(|gi| spec_perm[(gi, kk)]).collect();
                     let ranked = rank_descending(&scores);
-                    for cc in 0..c {
+                    for &cc in &want {
                         es_raw[(kk, cc)] = weighted_ks_es(&ranked, &hit_weights[cc]);
                     }
                 }
@@ -575,7 +815,7 @@ pub fn annotate(
         let mut perm_sd = Mat::zeros(k, c);
         let mut sd_floor_hits = 0usize;
         for kk in 0..k {
-            for cc in 0..c {
+            for &cc in &want {
                 let var = if b_perm > 1 {
                     perm_m2[(kk, cc)] / (b_perm as f32 - 1.0)
                 } else {
@@ -610,7 +850,7 @@ pub fn annotate(
         // degeneracy ships safely. Fall back to es_std only when the null is
         // MOSTLY un-estimable — i.e. too few permutable pseudobulk samples, which
         // collapses the majority of per-(k,c) variances to the floor.
-        let floored_frac = sd_floor_hits as f32 / (k * c).max(1) as f32;
+        let floored_frac = sd_floor_hits as f32 / (k * want.len()).max(1) as f32;
         if floored_frac < 0.5 {
             perm_z_kc = Some(pz);
         } else {
@@ -618,7 +858,7 @@ pub fn annotate(
                 "sample-permutation null mostly degenerate ({:.0}% of {} k×c perm_sd at floor); \
                  suppressing perm-z, ontology falls back to row-randomization es_std",
                 100.0 * floored_frac,
-                k * c
+                k * want.len()
             );
         }
 
@@ -631,6 +871,10 @@ pub fn annotate(
         let total_pool = (b_perm * k) as f32;
         pooled_null.reserve(c);
         for cc in 0..c {
+            if !scored(cc) {
+                pooled_null.push(Vec::new());
+                continue;
+            }
             let mut pool: Vec<f32> = Vec::with_capacity(b_perm * k);
             for es_raw in &perm_es_raw {
                 for kk in 0..k {
@@ -650,113 +894,20 @@ pub fn annotate(
         }
     }
 
-    // BH FDR per topic row (C tests per row). This is the right scale for
-    // two reasons: (a) Q is built per-topic (softmax over significant edges
-    // in a row), so per-row error control matches downstream use; (b) the
-    // pooled sample-permutation null shares values across topics within a
-    // celltype, so global K × C BH over-corrects for dependent tests.
-    //
-    // Only the cell types with a live panel are hypotheses: a type dropped by `min_markers` gets
-    // p = q = 1 and stays out of every family, or it would enlarge m (and, with a floor p, once
-    // topped every row).
-    let tested_idx: Vec<usize> = (0..c).filter(|&cc| tested[cc]).collect();
+    // Untested types get p = 1 in `adjust`, which is exact: no Monte Carlo error.
     for cc in (0..c).filter(|&cc| !tested[cc]) {
-        for kk in 0..k {
-            pvalue[(kk, cc)] = 1.0;
-            p_log2err[(kk, cc)] = 0.0;
-        }
+        p_log2err.column_mut(cc).fill(0.0);
     }
-    let mut qvalue = Mat::from_element(k, c, 1.0);
-    match type_tree.as_ref() {
-        // TreeBH within each topic row: families are the tree's nodes, so a fine type is tested
-        // only where its coarser class is, and FDR holds at every level of the tree at once.
-        Some((root, children, leaf)) => {
-            let rows: Vec<Vec<f64>> = (0..k)
-                .into_par_iter()
-                .map(|kk| {
-                    let mut leaf_p = vec![None; children.len()];
-                    for (cc, l) in leaf.iter().enumerate() {
-                        if let Some(l) = *l {
-                            leaf_p[l] = Some(f64::from(pvalue[(kk, cc)]));
-                        }
-                    }
-                    let q = treebh_q(children, *root, &leaf_p, false);
-                    leaf.iter().map(|l| l.map_or(1.0, |l| q[l])).collect()
-                })
-                .collect();
-            for (kk, row) in rows.iter().enumerate() {
-                for cc in 0..c {
-                    qvalue[(kk, cc)] = row[cc] as f32;
-                }
-            }
-        }
-        None => {
-            for kk in 0..k {
-                let row_p: Vec<f32> = tested_idx.iter().map(|&cc| pvalue[(kk, cc)]).collect();
-                let row_q = benjamini_hochberg(&row_p);
-                for (&cc, &q) in tested_idx.iter().zip(&row_q) {
-                    qvalue[(kk, cc)] = q;
-                }
-            }
-        }
-    }
-
-    // Q matrix (FDR-sparse, row-softmax) over the probit of the final p.
-    let z = probit_z(&pvalue);
-    let q_mat = build_q_matrix(&z, &qvalue, config.fdr_alpha, config.q_softmax_temperature);
-
-    // Cell-level posterior + labels — the single-pass point estimate.
-    let (mut posterior, mut labels) = label_cells(
-        &inputs.cell_membership_nk,
-        &q_mat,
-        &inputs.cell_names,
-        celltype_names,
-        config.min_confidence,
-    );
-
-    // The stability bootstrap. When it runs, its consensus REPLACES the point estimate above: a
-    // cluster whose call cannot survive resampling of its own marker panel should not ship that
-    // call with a softmaxed `confidence` of 0.98 beside it.
-    let bootstrap = match config.bootstrap.as_ref() {
-        None => None,
-        Some(bcfg) => {
-            let boot = run_cluster_bootstrap(
-                &ranked_per_k,
-                markers_gc,
-                &strata,
-                &pooled_null,
-                g,
-                config.fdr_alpha,
-                config.q_softmax_temperature,
-                config.seed,
-                bcfg,
-            )?;
-            let (bp, bl) = broadcast_to_cells(
-                &boot,
-                &inputs.cell_membership_nk,
-                &inputs.cell_names,
-                celltype_names,
-                &q_mat,
-            );
-            posterior = bp;
-            labels = bl;
-            Some(boot)
-        }
-    };
-
-    Ok(AnnotateOutputs {
-        q_kc: q_mat,
-        es_kc: es_obs,
-        es_restandardized_kc: es_obs_std,
-        nes_kc: nes,
-        z_kc: z,
+    Ok(Scores {
+        es_obs,
+        es_obs_std,
+        nes,
         perm_z_kc,
-        pvalue_kc: pvalue,
-        p_log2err_kc: p_log2err,
-        qvalue_kc: qvalue,
-        cell_annotation_nc: posterior,
-        argmax_labels: labels,
-        bootstrap,
+        pvalue,
+        p_log2err,
+        ranked_per_k,
+        strata,
+        pooled_null,
     })
 }
 
