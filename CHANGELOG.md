@@ -10,7 +10,11 @@ defaults.
 
 - `fgsea` module: the exact weighted-KS score from hit ranks in `O(m log m)` (`es_from_hits`),
   and fgsea's multilevel p-value (`multilevel_p`, `Multilevel`) for tails the gene-set null's
-  draws cannot resolve.
+  draws cannot resolve. It follows fgseaMultilevel's `EsRuler`: per-level posterior-mean log
+  estimates `ψ(h + 1) − ψ(n + 1)`, `log2err` summed from per-level `ψ₁` variances, ties broken
+  by a gene hash, and MCMC until `n·m/2` swaps are accepted, then as many sweeps again.
+  `log2err` is NaN where the p is only a bound (it reached `eps`, no sampled set reached the
+  score, or a level's MCMC hit its sweep cap).
 - `treebh::TypeTree` and `treebh::treebh_q`: TreeBH-adjusted q-values over a tree of cell types.
 - `AnnotateConfig::multilevel` (default on) and `AnnotateConfig::type_tree` (default `None`).
 - `AnnotateOutputs::nes_kc` (fgsea's normalized enrichment score, the reported effect size),

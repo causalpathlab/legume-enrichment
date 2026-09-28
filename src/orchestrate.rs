@@ -222,6 +222,7 @@ pub struct AnnotateOutputs {
     pub perm_z_kc: Option<Mat>,
     pub pvalue_kc: Mat,
     /// The SD of `log2 p` where the multilevel estimate set the p-value (fgsea's `log2err`), else 0.
+    /// NaN, as fgsea's NA, where the multilevel p is only a bound and its error unknown.
     pub p_log2err_kc: Mat,
     /// Per topic row: BH, or TreeBH over `config.type_tree` when given.
     pub qvalue_kc: Mat,

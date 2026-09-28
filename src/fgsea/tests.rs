@@ -62,7 +62,7 @@ fn hits_at_the_edges_score_as_the_walk_does() {
     }
 }
 
-/// Brute force `P(ES ≥ obs | ES ≥ 0)` from `draws` matched null sets.
+/// Brute force `P(ES ≥ obs | ES ≥ 0)` from `draws` matched null sets, and the count behind it.
 fn brute_force(
     obs: f32,
     pos: &[u32],
@@ -70,7 +70,7 @@ fn brute_force(
     profile: &[Vec<f32>],
     draws: usize,
     rng: &mut SmallRng,
-) -> f64 {
+) -> (f64, usize) {
     let (mut scratch, mut drawn) = (strata.scratch(), Vec::new());
     let (mut ge, mut pos_n) = (0usize, 0usize);
     for _ in 0..draws {
@@ -83,7 +83,7 @@ fn brute_force(
             ge += usize::from(es >= obs);
         }
     }
-    ge as f64 / pos_n as f64
+    (ge as f64 / pos_n as f64, ge)
 }
 
 #[test]
@@ -97,21 +97,54 @@ fn multilevel_agrees_with_brute_force_and_reaches_below_it() {
 
     // A tail brute force can still see.
     let obs = 0.25;
-    let truth = brute_force(obs, &pos, &strata, &profile, 200_000, &mut rng);
+    let (truth, truth_hits) = brute_force(obs, &pos, &strata, &profile, 200_000, &mut rng);
     assert!(
         truth > 1e-3 && truth < 0.05,
         "pick a resolvable tail: {truth}"
     );
-    let ml = multilevel_p(obs, &pos, &strata, &profile, &settings, &mut rng).unwrap();
-    let off = (ml.p.log2() - truth.log2()).abs();
+    // Unbiased in log: the mean of log2 p over independent runs sits on the truth within the
+    // runs' own reported error, shrunk by √runs, plus the brute force's binomial error.
+    let runs = 40;
+    let mut mean = 0.0;
+    let mut err2 = 0.0;
+    let mut ml = None;
+    for _ in 0..runs {
+        let r = multilevel_p(obs, &pos, &strata, &profile, &settings, &mut rng).unwrap();
+        assert!(r.log2err.is_finite() && r.log2err > 0.0, "{r:?}");
+        mean += r.p.log2() / runs as f64;
+        err2 += r.log2err.powi(2) / runs as f64;
+        ml = Some(r);
+    }
+    let ml = ml.unwrap();
+    let off = (mean - truth.log2()).abs();
+    let truth_err = (1.0 / truth_hits as f64).sqrt() / std::f64::consts::LN_2;
+    let tol = 3.0 * (err2 / runs as f64 + truth_err.powi(2)).sqrt();
     assert!(
-        off < 3.0 * ml.log2err + 0.3,
-        "multilevel {} vs brute force {truth} ({ml:?})",
-        ml.p
+        off < tol,
+        "mean log2 p {mean} vs brute force {} (off {off}, tol {tol})",
+        truth.log2()
     );
 
     // Far past any feasible number of draws: still a finite, smaller p.
     let deep = multilevel_p(0.6, &pos, &strata, &profile, &settings, &mut rng).unwrap();
     assert!(deep.p < ml.p * 1e-3 && deep.p >= settings.eps, "{deep:?}");
     assert!(deep.levels > ml.levels);
+    assert!(deep.log2err.is_finite(), "{deep:?}");
+}
+
+#[test]
+fn the_most_extreme_set_is_reported_as_a_bound_at_eps() {
+    // The panel is the top 30 genes: ES = 1, true p ≈ 1 / C(490, 30), below any f32 p.
+    let g = 490;
+    let mut rng = SmallRng::seed_from_u64(3);
+    let pos: Vec<u32> = (0..g as u32).collect();
+    let strata = GeneStrata::unstratified(g);
+    let profile = vec![vec![1.0f32; 30]];
+    let mut hits: Vec<(u32, f32)> = (0..30).map(|r| (r, 1.0)).collect();
+    let obs = es_from_hits(&mut hits, g);
+    assert_eq!(obs, 1.0);
+    let settings = Multilevel::default();
+    let r = multilevel_p(obs, &pos, &strata, &profile, &settings, &mut rng).unwrap();
+    assert_eq!(r.p, settings.eps, "{r:?}");
+    assert!(r.log2err.is_nan(), "a bound has no error: {r:?}");
 }
