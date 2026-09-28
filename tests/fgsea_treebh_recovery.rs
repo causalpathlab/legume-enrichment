@@ -3,7 +3,10 @@
 
 use enrichment::fgsea::Multilevel;
 use enrichment::treebh::TypeTree;
-use enrichment::{annotate, AnnotateConfig, AnnotateOutputs, GroupInputs, Mat, SpecificityMode};
+use enrichment::{
+    adjust, annotate, annotate_types, AnnotateConfig, AnnotateOutputs, GroupInputs, Mat,
+    SpecificityMode,
+};
 
 const K: usize = 3;
 const BLOCK: usize = 30;
@@ -280,4 +283,43 @@ fn q_rows_are_a_softmax_of_the_probit_z_over_the_fdr_survivors() {
         }
     }
     assert!(any, "no FDR survivor to check");
+}
+
+#[test]
+fn a_subset_of_types_scores_as_the_full_run_does_and_adjust_finishes_it() {
+    let extra = [null_panel(), (0..BLOCK / 2).collect()];
+    for perms in [0, 40] {
+        let cfg = AnnotateConfig {
+            num_sample_perm: perms,
+            ..config()
+        };
+        let (inputs, markers, names) = fixture(&extra);
+        let full = annotate(&inputs, &markers, &names, &cfg).unwrap();
+        let types = [4, 1];
+        let part = annotate_types(&inputs, &markers, &names, &cfg, &types).unwrap();
+        for (j, &cc) in types.iter().enumerate() {
+            for kk in 0..K {
+                let same = |a: &Mat, b: &Mat, what: &str| {
+                    let (x, y) = (a[(kk, j)], b[(kk, cc)]);
+                    assert!(
+                        x == y || (x.is_nan() && y.is_nan()),
+                        "{what}[{kk},{cc}] with {perms} perms: {x} vs {y}"
+                    );
+                };
+                same(&part.es_kc, &full.es_kc, "es");
+                same(
+                    &part.es_restandardized_kc,
+                    &full.es_restandardized_kc,
+                    "es_std",
+                );
+                same(&part.nes_kc, &full.nes_kc, "nes");
+                same(&part.pvalue_kc, &full.pvalue_kc, "p");
+                same(&part.p_log2err_kc, &full.p_log2err_kc, "log2err");
+            }
+        }
+        let adj = adjust(&full.pvalue_kc, &markers, &cfg).unwrap();
+        assert_eq!(adj.qvalue_kc, full.qvalue_kc);
+        assert_eq!(adj.q_kc, full.q_kc);
+        assert_eq!(adj.z_kc, full.z_kc);
+    }
 }

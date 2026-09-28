@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1
+
+Additive only.
+
+### Added
+
+- `annotate_types`: a subset of the panel's cell types scored exactly as `annotate` scores
+  them (ES, restandardized ES, NES, p, `log2err`), with both nulls drawn only for those types.
+  Rescoring the types a marker edit touches then costs a fraction of a full run.
+- `adjust`: `annotate`'s FDR (BH or TreeBH) and Q step on a topic × type p-value matrix, for
+  finishing a row whose p-values come from several runs. `annotate` now goes through it.
+- `live_types`: the types that are hypotheses (a live panel of at least `max(min_markers, 2)`
+  markers, short of the whole gene universe).
+
 ## 0.4.0
 
 **Breaking** relative to 0.3: new public fields on `AnnotateConfig` and `AnnotateOutputs`
