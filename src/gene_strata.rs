@@ -65,15 +65,15 @@ pub struct GeneStrata {
 }
 
 impl GeneStrata {
-    /// Bin every gene into at most [`N_STRATA`] equal-count bins of increasing abundance
+    /// Bin every gene into at most `N_STRATA` equal-count bins of increasing abundance
     /// (`Σ_k profile[g, k]`).
     ///
     /// Equal-count (quantile) bins rather than equal-width: expression is heavy-tailed, so
     /// equal-width bins would put almost every gene in the bottom bin and leave the top bin with
     /// nothing to swap a highly-expressed marker with.
     ///
-    /// [`N_STRATA`] is a ceiling, not a target: the count is reduced until every bin holds at least
-    /// [`MIN_PER_STRATUM`] genes, so a tiny gene pool gets few bins (and, in the limit, one — an
+    /// `N_STRATA` is a ceiling, not a target: the count is reduced until every bin holds at least
+    /// `MIN_PER_STRATUM` genes, so a tiny gene pool gets few bins (and, in the limit, one — an
     /// unstratified draw) rather than a null that cannot move.
     #[must_use]
     pub fn by_abundance(profile_gk: &Mat) -> Self {

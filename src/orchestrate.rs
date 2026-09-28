@@ -13,7 +13,7 @@
 //!      marker bootstrap still use it);
 //!    - with `num_sample_perm == 0`, the **p-value**: fgsea's sign-aware
 //!      `(#null ≥ ES + 1) / (#null ≥ 0 + 1)`, `1` for ES ≤ 0 (depletion is not a call). Where
-//!      fewer than [`MULTILEVEL_BELOW`] draws reach ES, fgsea's **multilevel** estimate
+//!      fewer than `MULTILEVEL_BELOW` (10) draws reach ES, fgsea's **multilevel** estimate
 //!      ([`crate::fgsea::multilevel_p`]) replaces it, reaching below `1 / (B + 1)`.
 //!
 //!    It keeps the marginal scale of the per-gene scores and destroys gene-gene correlation.
