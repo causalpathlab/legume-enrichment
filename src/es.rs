@@ -14,6 +14,17 @@ pub fn rank_descending(scores: &[f32]) -> Vec<u32> {
     order
 }
 
+/// The inverse of a ranking: `pos[gene]` = the rank of `gene` in `order` (0 = the top), the input
+/// [`crate::fgsea::es_from_hits`] scores from.
+#[must_use]
+pub fn positions(order: &[u32]) -> Vec<u32> {
+    let mut pos = vec![0u32; order.len()];
+    for (r, &gene) in order.iter().enumerate() {
+        pos[gene as usize] = r as u32;
+    }
+    pos
+}
+
 /// Weighted KS enrichment score over a ranked gene list.
 ///
 /// * `ranked_indices` — indices of genes in descending-specificity order.

@@ -60,3 +60,93 @@ fn simes_and_bh_basics() {
     assert_eq!(bh_reject(&[0.001, 0.2, 0.2], 0.1, false), vec![0]);
     assert!(bh_reject(&[0.9, 0.9], 0.1, false).is_empty());
 }
+
+#[test]
+fn a_tree_q_is_the_smallest_target_that_rejects() {
+    let (children, _) = tree();
+    let mut leaf_p = vec![None; 7];
+    leaf_p[2] = Some(0.001);
+    leaf_p[4] = Some(0.01);
+    leaf_p[6] = Some(0.9);
+    let q = treebh_q(&children, 0, &leaf_p, false);
+    assert_eq!(q[0], 0.0);
+    for (v, &qv) in q.iter().enumerate().skip(1) {
+        for alpha in [0.01, 0.03, 0.05, 0.1, 0.2, 0.5] {
+            let order = postorder(&children, 0);
+            let cp = combine_bottom_up(&children, &order, &leaf_p);
+            let rejected = descend(&children, 0, &cp, alpha, false)[v];
+            // Away from the threshold itself, q ≤ α exactly when TreeBH at α rejects.
+            if (qv - alpha).abs() > 1e-9 {
+                assert_eq!(qv <= alpha, rejected, "node {v} at {alpha}: q {qv}");
+            }
+        }
+    }
+    assert!(q[4] > q[2], "a subtype is gated by its parent family");
+    assert!(
+        q[6] >= 0.9 - 1e-9,
+        "CD4 (p 0.9) is rejected only at a target that high: {}",
+        q[6]
+    );
+}
+
+#[test]
+fn a_flat_tree_gives_the_bh_q_values() {
+    // Root over five leaves: TreeBH is plain BH.
+    let children = vec![vec![1, 2, 3, 4, 5], vec![], vec![], vec![], vec![], vec![]];
+    let ps = [0.001, 0.008, 0.039, 0.041, 0.6];
+    let mut leaf_p = vec![None];
+    leaf_p.extend(ps.iter().map(|&p| Some(p)));
+    let q = treebh_q(&children, 0, &leaf_p, false);
+    // BH: q_(i) = min_{j ≥ i} m p_(j) / j.
+    let bh = [0.005, 0.02, 0.05125, 0.05125, 0.6];
+    for (i, &want) in bh.iter().enumerate() {
+        assert!(
+            (q[i + 1] - want).abs() < 1e-6,
+            "leaf {i}: {} vs {want}",
+            q[i + 1]
+        );
+    }
+}
+
+#[test]
+fn types_missing_from_the_tree_hang_under_the_root() {
+    let tree = TypeTree {
+        children: vec![vec![1], vec![2], vec![]],
+        root: 0,
+        leaf: vec![Some(2), None],
+    };
+    let (children, leaf) = tree.completed(&[true; 3]).unwrap();
+    assert_eq!(leaf, [Some(2), Some(3), Some(4)]);
+    assert_eq!(children[0], [1, 3, 4]);
+    let bad = TypeTree {
+        children: vec![vec![1], vec![2], vec![]],
+        root: 0,
+        leaf: vec![Some(1)],
+    };
+    assert!(bad.completed(&[true]).is_err(), "a leaf with children");
+    let shared = TypeTree {
+        children: vec![vec![1], vec![]],
+        root: 0,
+        leaf: vec![Some(1), Some(1)],
+    };
+    assert!(
+        shared.completed(&[true; 2]).is_err(),
+        "two types on one leaf"
+    );
+}
+
+#[test]
+fn untested_types_and_their_empty_subtrees_leave_the_families() {
+    // root 0 → {class 1 → {leaf 2, leaf 3}, class 4 → {leaf 5}}; type 2 is untested and type 3
+    // has no leaf in the tree and is untested too.
+    let tree = TypeTree {
+        children: vec![vec![1, 4], vec![2, 3], vec![], vec![], vec![5], vec![]],
+        root: 0,
+        leaf: vec![Some(2), Some(3), Some(5), None],
+    };
+    let (children, leaf) = tree.completed(&[true, true, false, false]).unwrap();
+    assert_eq!(leaf, [Some(2), Some(3), None, None]);
+    assert_eq!(children[0], [1], "class 4 lost its only tested leaf");
+    assert_eq!(children[1], [2, 3]);
+    assert_eq!(children.len(), 6, "no leaf added for the untested type");
+}

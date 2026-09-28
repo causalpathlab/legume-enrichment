@@ -1,43 +1,125 @@
-//! Public API: `annotate()` wires specificity → ES → Efron–Tibshirani
-//! restandardization → pooled sample-permutation p-value → FDR → Q matrix
-//! → cell labels.
+//! Public API: `annotate()` wires specificity → ES → gene-set null (NES, restandardized ES,
+//! p-value) → FDR (BH or TreeBH) → Q matrix → cell labels.
 //!
-//! **Two nulls, combined per Efron–Tibshirani 2007.**
+//! **Two nulls.**
 //!
-//! 1. **Row randomization** (randomization model): draw random size-|M_c|
-//!    gene sets, compute ES on observed β specificity. Gives the (mean*, SD*)
-//!    moments used to restandardize observed and permuted ES. Captures the
-//!    marginal scale of per-gene scores correctly but destroys gene-gene
-//!    correlation.
+//! 1. **Gene-set null** (row randomization, randomization model): draw random gene sets matched
+//!    to each panel's abundance strata and weights ([`crate::gene_strata`]) and score them on the
+//!    observed β specificity from their hit ranks alone ([`crate::fgsea::es_from_hits`]). One
+//!    pass gives
+//!    - fgsea's **NES** = ES / mean(null ES on ES's side of zero), the reported effect size;
+//!    - the Efron–Tibshirani (mean*, SD*) moments, for the restandardized ES
+//!      `(ES − mean*) / SD*` (`es_restandardized_kc`, the sample-permutation z and the
+//!      marker bootstrap still use it);
+//!    - with `num_sample_perm == 0`, the **p-value**: fgsea's sign-aware
+//!      `(#null ≥ ES + 1) / (#null ≥ 0 + 1)`, `1` for ES ≤ 0 (depletion is not a call). Where
+//!      fewer than `MULTILEVEL_BELOW` (10) draws reach ES, fgsea's **multilevel** estimate
+//!      ([`crate::fgsea::multilevel_p`]) replaces it, reaching below `1 / (B + 1)`.
 //!
-//! 2. **Sample permutation** (permutation model): shuffle `pb_membership_pk`
-//!    rows (optionally within batch blocks), recompute
-//!    `β̃ = pb_gene · shuffled_membership`, re-specificity, re-rank, re-ES.
-//!    Preserves gene-gene correlation; destroys PB-topic coupling. Naive
-//!    per-(k, c) comparison suffers from topic label-switching (~1/K of
-//!    permutations happen to be equivalent to a topic relabeling), so we
-//!    **pool** the permuted ES across all K topics per celltype — the null
-//!    distribution for (k, c) is {es_std_perm[k', c] : all k', all perms}.
-//!    This is invariant to topic relabeling.
+//!    It keeps the marginal scale of the per-gene scores and destroys gene-gene correlation.
 //!
-//! Restandardized observed ES = (ES − mean*) / SD*. Same restandardization
-//! applied to each permuted ES. p-value = fraction of pooled permuted
-//! restandardized ES ≥ observed restandardized ES.
+//! 2. **Sample permutation** (permutation model, `num_sample_perm > 0`): shuffle
+//!    `pb_membership_pk` rows (optionally within batch blocks), recompute
+//!    `β̃ = pb_gene · shuffled_membership`, re-specificity, re-rank, re-ES. Preserves gene-gene
+//!    correlation; destroys PB-topic coupling. Naive per-(k, c) comparison suffers from topic
+//!    label-switching (~1/K of permutations happen to be equivalent to a topic relabeling), so
+//!    we **pool** the permuted restandardized ES across all K topics per celltype — the null for
+//!    (k, c) is {es_std_perm[k', c] : all k', all perms}, invariant to topic relabeling — and the
+//!    p-value is the fraction of that pool ≥ the observed restandardized ES.
+//!
+//! **FDR.** Per topic row: BH over cell types, or, with `config.type_tree`, TreeBH over a tree of
+//! cell types ([`crate::treebh::treebh_q`]), so a fine type is only called where its coarser
+//! class is and FDR holds at every level of the tree.
+//!
+//! **Q matrix.** Over the probit of the final p, `z = Φ⁻¹(1 − p)` (`z_kc`): entries with
+//! q ≥ `fdr_alpha` or z ≤ 0 are zeroed; the rest are row-softmaxed over z at
+//! `q_softmax_temperature` ([`build_q_matrix`]). When the marker bootstrap runs, its
+//! consensus (restandardized ES, BH) replaces this point estimate's labels.
 
 use crate::cellproj::{label_cells, LabelWithConfidence};
 use crate::consensus::{MIN_LIVE_MARKERS, UNASSIGNED};
-use crate::es::{rank_descending, weighted_ks_es};
+use crate::es::{positions, rank_descending, weighted_ks_es};
+use crate::fgsea::{es_from_hits, multilevel_p, Multilevel, MultilevelP};
 use crate::gene_strata::GeneStrata;
 use crate::marker_bootstrap::{run_cluster_bootstrap, ClusterBootstrap, EnrichmentBootstrapConfig};
 use crate::null::permute_indices;
 use crate::q_matrix::build_q_matrix;
 use crate::specificity::{compute_specificity, SpecificityMode};
+use crate::treebh::{treebh_q, TypeTree};
 use crate::Mat;
 use indicatif::{ParallelProgressIterator, ProgressStyle};
 use legume_numeric::matrix::hypothesis::benjamini_hochberg;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
+use statrs::distribution::{ContinuousCDF, Normal};
+
+/// A gene-set null draw count under which the multilevel estimate takes over the p-value.
+const MULTILEVEL_BELOW: usize = 10;
+
+/// One (topic, cell type)'s gene-set null, accumulated a draw at a time: Welford moments for the
+/// restandardized ES, and each side's mass and the tail at the observed score for NES and p.
+#[derive(Clone, Copy, Default)]
+struct NullTail {
+    n: usize,
+    mean: f32,
+    m2: f32,
+    pos_n: usize,
+    pos_sum: f64,
+    neg_sum: f64,
+    /// Draws at least the observed score, for a positive one (only enrichment is tested).
+    n_ge: usize,
+}
+
+impl NullTail {
+    fn add(&mut self, es: f32, obs: f32) {
+        self.n += 1;
+        let prev = self.mean;
+        self.mean += (es - prev) / self.n as f32;
+        self.m2 += (es - prev) * (es - self.mean);
+        if es >= 0.0 {
+            self.pos_n += 1;
+            self.pos_sum += f64::from(es);
+        } else {
+            self.neg_sum += f64::from(es);
+        }
+        if obs > 0.0 && es >= obs {
+            self.n_ge += 1;
+        }
+    }
+
+    fn nes(&self, obs: f32) -> f32 {
+        let side = if obs >= 0.0 {
+            (self.pos_n > 0).then(|| self.pos_sum / self.pos_n as f64)
+        } else {
+            let neg_n = self.n - self.pos_n;
+            (neg_n > 0).then(|| -self.neg_sum / neg_n as f64)
+        };
+        match side {
+            Some(m) if m > 0.0 => (f64::from(obs) / m) as f32,
+            _ => 0.0,
+        }
+    }
+
+    fn p(&self, obs: f32) -> f32 {
+        if obs <= 0.0 {
+            return 1.0;
+        }
+        (self.n_ge as f32 + 1.0) / (self.pos_n as f32 + 1.0)
+    }
+}
+
+/// `z = Φ⁻¹(1 − p)` per entry, computed as `−Φ⁻¹(p)` so a tiny p does not round `1 − p` to 1.
+/// p is clamped to `[f32::MIN_POSITIVE, 1 − f32::EPSILON]` first, so z is finite (≈ 13.1 down
+/// to ≈ −5.3).
+fn probit_z(pvalue: &Mat) -> Mat {
+    let normal = Normal::standard();
+    let hi = 1.0 - f64::from(f32::EPSILON);
+    pvalue.map(|p| {
+        let p = f64::from(p).clamp(f64::from(f32::MIN_POSITIVE), hi);
+        -normal.inverse_cdf(p) as f32
+    })
+}
 
 pub struct GroupInputs {
     /// G × K group-profile matrix: topic β (simplex), SVD loadings (signed),
@@ -97,6 +179,12 @@ pub struct AnnotateConfig {
     ///
     /// The library default is `None`; senna's CLI turns it **on**, as `senna annotate-gem` does.
     pub bootstrap: Option<EnrichmentBootstrapConfig>,
+    /// Refine the gene-set null's p-value by fgsea's multilevel estimate where its draws cannot
+    /// resolve the tail ([`crate::fgsea`]). `None` keeps the draws' p.
+    pub multilevel: Option<Multilevel>,
+    /// Adjust each topic row's p-values by TreeBH over this tree of cell types instead of flat BH
+    /// ([`crate::treebh::treebh_q`]).
+    pub type_tree: Option<TypeTree>,
 }
 
 impl Default for AnnotateConfig {
@@ -113,6 +201,8 @@ impl Default for AnnotateConfig {
             min_markers: 3,
             stratify_null: true,
             bootstrap: None,
+            multilevel: Some(Multilevel::default()),
+            type_tree: None,
         }
     }
 }
@@ -121,11 +211,19 @@ pub struct AnnotateOutputs {
     pub q_kc: Mat,
     pub es_kc: Mat,
     pub es_restandardized_kc: Mat,
+    /// fgsea's normalized enrichment score: ES over the mean of the gene-set null on its side of
+    /// zero. The reported effect size.
+    pub nes_kc: Mat,
+    /// The probit of `pvalue_kc`, `z = Φ⁻¹(1 − p)`: the score `q_kc` is a softmax of.
+    pub z_kc: Mat,
     /// Sample-permutation z = (ES − perm_mean)/perm_sd against the correlation-
     /// preserving null. `None` when `num_sample_perm == 0`. Graded (unlike the
     /// pooled, FWER-style `pvalue_kc`) — the preferred ontology-annotator input.
     pub perm_z_kc: Option<Mat>,
     pub pvalue_kc: Mat,
+    /// The SD of `log2 p` where the multilevel estimate set the p-value (fgsea's `log2err`), else 0.
+    pub p_log2err_kc: Mat,
+    /// Per topic row: BH, or TreeBH over `config.type_tree` when given.
     pub qvalue_kc: Mat,
     pub cell_annotation_nc: Mat,
     pub argmax_labels: Vec<LabelWithConfidence>,
@@ -189,10 +287,9 @@ pub fn annotate(
         .map(|hw| hw.iter().filter(|&&w| w > 0.0).count())
         .collect();
 
-    // Drop the celltypes the panel cannot support. Zeroing the column is the one lever every
-    // consumer already respects: `weighted_ks_es` returns 0.0 for an empty hit vector, and a zero
-    // ES can never clear `build_q_matrix`'s `es_std > 0` gate — so the type keeps its column in
-    // every output and simply never wins a cluster.
+    // Drop the celltypes the panel cannot support. Zeroing the column gives them ES = 0; `tested`
+    // below then keeps them out of the null, the multilevel pass and every FDR family (p = q = 1),
+    // so the type keeps its column in every output and simply never wins a cluster.
     {
         let bar = config.min_markers.max(MIN_LIVE_MARKERS);
         let dropped: Vec<String> = (0..c)
@@ -222,6 +319,18 @@ pub fn annotate(
             );
         }
     }
+
+    // The hypotheses: types with a live panel that is not the whole gene universe (whose null is
+    // degenerate). A malformed type tree fails here, before any null is drawn.
+    let tested: Vec<bool> = marker_sizes.iter().map(|&m| m > 0 && m < g).collect();
+    let type_tree = config
+        .type_tree
+        .as_ref()
+        .map(|t| {
+            t.completed(&tested)
+                .map(|(children, leaf)| (t.root, children, leaf))
+        })
+        .transpose()?;
 
     // Observed specificity and ranked orderings per topic.
     let specificity_obs = compute_specificity(&inputs.profile_gk, config.specificity);
@@ -279,16 +388,19 @@ pub fn annotate(
         .collect();
     let strata_profile: Vec<Vec<Vec<f32>>> = live.iter().map(|p| strata.profile_of(p)).collect();
 
-    let row_moments: Vec<(Vec<f32>, Vec<f32>)> = (0..c)
+    // Each topic's ranking as gene → rank, so a null set is scored from its genes' ranks alone
+    // (`fgsea::es_from_hits`, O(m log m)) instead of by a walk over every gene.
+    let pos_per_k: Vec<Vec<u32>> = ranked_per_k.iter().map(|o| positions(o)).collect();
+
+    let row_stats: Vec<Vec<NullTail>> = (0..c)
         .into_par_iter()
         .progress_with_style(style.clone())
-        .with_message("row randomization")
+        .with_message("gene-set null")
         .map(|cc| {
             let m_size = marker_sizes[cc];
-            let mut mean = vec![0.0f32; k];
-            let mut m2 = vec![0.0f32; k];
-            if m_size == 0 || m_size >= g {
-                return (mean, m2);
+            let mut tails = vec![NullTail::default(); k];
+            if !tested[cc] {
+                return tails;
             }
             let mut rng = SmallRng::seed_from_u64(
                 config
@@ -297,43 +409,38 @@ pub fn annotate(
             );
             let mut scratch = strata.scratch();
             let mut drawn: Vec<(u32, f32)> = Vec::with_capacity(m_size);
-            let mut hit_buf = vec![0.0f32; g];
-            for draw in 0..b_rand {
-                strata.draw_matched(&strata_profile[cc], &mut scratch, &mut drawn, &mut rng);
+            let mut hits: Vec<(u32, f32)> = Vec::with_capacity(m_size);
+            for _ in 0..b_rand {
                 // The null carries the panel's OWN weights, not a binary 1.0: the observed ES is
                 // IDF/specificity-weighted, and standardizing a weighted statistic against an
                 // unweighted null compares two different quantities.
-                for &(gi, w) in &drawn {
-                    hit_buf[gi as usize] = w;
-                }
+                strata.draw_matched(&strata_profile[cc], &mut scratch, &mut drawn, &mut rng);
                 for kk in 0..k {
-                    let es = weighted_ks_es(&ranked_per_k[kk], &hit_buf);
-                    let prev_mean = mean[kk];
-                    let new_mean = prev_mean + (es - prev_mean) / (draw as f32 + 1.0);
-                    m2[kk] += (es - prev_mean) * (es - new_mean);
-                    mean[kk] = new_mean;
-                }
-                // Reset only what was touched; `fill(0)` over G would dominate the loop.
-                for &(gi, _) in &drawn {
-                    hit_buf[gi as usize] = 0.0;
+                    hits.clear();
+                    hits.extend(drawn.iter().map(|&(gi, w)| (pos_per_k[kk][gi as usize], w)));
+                    let es = es_from_hits(&mut hits, g);
+                    tails[kk].add(es, es_obs[(kk, cc)]);
                 }
             }
-            (mean, m2)
+            tails
         })
         .collect();
+    // fgsea's NES: the score over the mean of the null on its own side of zero.
+    let mut nes = Mat::zeros(k, c);
+    for cc in 0..c {
+        for kk in 0..k {
+            nes[(kk, cc)] = row_stats[cc][kk].nes(es_obs[(kk, cc)]);
+        }
+    }
 
     let mut row_mean = Mat::zeros(k, c);
     let mut row_sd = Mat::zeros(k, c);
     let bf = b_rand as f32;
     for cc in 0..c {
-        let (mean_vec, m2_vec) = &row_moments[cc];
         for kk in 0..k {
-            row_mean[(kk, cc)] = mean_vec[kk];
-            let var = if bf > 1.0 {
-                m2_vec[kk] / (bf - 1.0)
-            } else {
-                0.0
-            };
+            let tail = &row_stats[cc][kk];
+            row_mean[(kk, cc)] = tail.mean;
+            let var = if bf > 1.0 { tail.m2 / (bf - 1.0) } else { 0.0 };
             row_sd[(kk, cc)] = var.sqrt().max(1e-8);
         }
     }
@@ -368,47 +475,52 @@ pub fn annotate(
     // Empty ⇒ the bootstrap falls back to exact row-randomization counts.
     let mut pooled_null: Vec<Vec<f32>> = Vec::new();
 
+    let mut p_log2err = Mat::zeros(k, c);
     if b_perm == 0 {
-        // Fallback: row-randomization p-value. Recount with the second pass — same abundance- and
-        // weight-matched null as the moments above, or the p-value would be calibrated against a
-        // different gene population than the one that standardized the statistic.
-        let counts: Vec<Vec<u32>> = (0..c)
-            .into_par_iter()
-            .map(|cc| {
-                let m_size = marker_sizes[cc];
-                let mut count = vec![0u32; k];
-                if m_size == 0 || m_size >= g {
-                    return count;
-                }
-                let mut rng = SmallRng::seed_from_u64(
-                    config
-                        .seed
-                        .wrapping_add(3_000_003u64.wrapping_mul(cc as u64 + 1)),
-                );
-                let mut scratch = strata.scratch();
-                let mut drawn: Vec<(u32, f32)> = Vec::with_capacity(m_size);
-                let mut hit_buf = vec![0.0f32; g];
-                for _ in 0..b_rand {
-                    strata.draw_matched(&strata_profile[cc], &mut scratch, &mut drawn, &mut rng);
-                    for &(gi, w) in &drawn {
-                        hit_buf[gi as usize] = w;
-                    }
-                    for kk in 0..k {
-                        let es = weighted_ks_es(&ranked_per_k[kk], &hit_buf);
-                        if es >= es_obs[(kk, cc)] {
-                            count[kk] += 1;
-                        }
-                    }
-                    for &(gi, _) in &drawn {
-                        hit_buf[gi as usize] = 0.0;
-                    }
-                }
-                count
-            })
-            .collect();
+        // fgsea's sign-aware p against the same abundance- and weight-matched null that gives
+        // NES: `(#null ≥ ES + 1) / (#null ≥ 0 + 1)`. A negative score is depletion, which a
+        // cell-type call does not test: p = 1.
         for cc in 0..c {
             for kk in 0..k {
-                pvalue[(kk, cc)] = (counts[cc][kk] as f32 + 1.0) / (bf + 1.0);
+                pvalue[(kk, cc)] = row_stats[cc][kk].p(es_obs[(kk, cc)]);
+            }
+        }
+        // Where the draws cannot resolve the tail, the multilevel estimate can.
+        if let Some(ml) = config.multilevel.as_ref() {
+            let deep: Vec<(usize, usize)> = (0..c)
+                .flat_map(|cc| (0..k).map(move |kk| (kk, cc)))
+                .filter(|&(kk, cc)| {
+                    tested[cc]
+                        && es_obs[(kk, cc)] > 0.0
+                        && row_stats[cc][kk].n_ge < MULTILEVEL_BELOW
+                })
+                .collect();
+            let refined: Vec<((usize, usize), Option<MultilevelP>)> = deep
+                .par_iter()
+                .progress_with_style(style.clone())
+                .with_message("multilevel p")
+                .map(|&(kk, cc)| {
+                    let mut rng = SmallRng::seed_from_u64(
+                        config
+                            .seed
+                            .wrapping_add(4_000_037u64.wrapping_mul((kk * c + cc) as u64 + 1)),
+                    );
+                    let r = multilevel_p(
+                        es_obs[(kk, cc)],
+                        &pos_per_k[kk],
+                        &strata,
+                        &strata_profile[cc],
+                        ml,
+                        &mut rng,
+                    );
+                    ((kk, cc), r)
+                })
+                .collect();
+            for ((kk, cc), r) in refined {
+                if let Some(r) = r {
+                    pvalue[(kk, cc)] = r.p as f32;
+                    p_log2err[(kk, cc)] = r.log2err as f32;
+                }
             }
         }
     } else {
@@ -542,22 +654,55 @@ pub fn annotate(
     // in a row), so per-row error control matches downstream use; (b) the
     // pooled sample-permutation null shares values across topics within a
     // celltype, so global K × C BH over-corrects for dependent tests.
-    let mut qvalue = Mat::zeros(k, c);
-    for kk in 0..k {
-        let row_p: Vec<f32> = (0..c).map(|cc| pvalue[(kk, cc)]).collect();
-        let row_q = benjamini_hochberg(&row_p);
-        for cc in 0..c {
-            qvalue[(kk, cc)] = row_q[cc];
+    //
+    // Only the cell types with a live panel are hypotheses: a type dropped by `min_markers` gets
+    // p = q = 1 and stays out of every family, or it would enlarge m (and, with a floor p, once
+    // topped every row).
+    let tested_idx: Vec<usize> = (0..c).filter(|&cc| tested[cc]).collect();
+    for cc in (0..c).filter(|&cc| !tested[cc]) {
+        for kk in 0..k {
+            pvalue[(kk, cc)] = 1.0;
+            p_log2err[(kk, cc)] = 0.0;
+        }
+    }
+    let mut qvalue = Mat::from_element(k, c, 1.0);
+    match type_tree.as_ref() {
+        // TreeBH within each topic row: families are the tree's nodes, so a fine type is tested
+        // only where its coarser class is, and FDR holds at every level of the tree at once.
+        Some((root, children, leaf)) => {
+            let rows: Vec<Vec<f64>> = (0..k)
+                .into_par_iter()
+                .map(|kk| {
+                    let mut leaf_p = vec![None; children.len()];
+                    for (cc, l) in leaf.iter().enumerate() {
+                        if let Some(l) = *l {
+                            leaf_p[l] = Some(f64::from(pvalue[(kk, cc)]));
+                        }
+                    }
+                    let q = treebh_q(children, *root, &leaf_p, false);
+                    leaf.iter().map(|l| l.map_or(1.0, |l| q[l])).collect()
+                })
+                .collect();
+            for (kk, row) in rows.iter().enumerate() {
+                for cc in 0..c {
+                    qvalue[(kk, cc)] = row[cc] as f32;
+                }
+            }
+        }
+        None => {
+            for kk in 0..k {
+                let row_p: Vec<f32> = tested_idx.iter().map(|&cc| pvalue[(kk, cc)]).collect();
+                let row_q = benjamini_hochberg(&row_p);
+                for (&cc, &q) in tested_idx.iter().zip(&row_q) {
+                    qvalue[(kk, cc)] = q;
+                }
+            }
         }
     }
 
-    // Q matrix (FDR-sparse, row-softmax).
-    let q_mat = build_q_matrix(
-        &es_obs_std,
-        &qvalue,
-        config.fdr_alpha,
-        config.q_softmax_temperature,
-    );
+    // Q matrix (FDR-sparse, row-softmax) over the probit of the final p.
+    let z = probit_z(&pvalue);
+    let q_mat = build_q_matrix(&z, &qvalue, config.fdr_alpha, config.q_softmax_temperature);
 
     // Cell-level posterior + labels — the single-pass point estimate.
     let (mut posterior, mut labels) = label_cells(
@@ -602,8 +747,11 @@ pub fn annotate(
         q_kc: q_mat,
         es_kc: es_obs,
         es_restandardized_kc: es_obs_std,
+        nes_kc: nes,
+        z_kc: z,
         perm_z_kc,
         pvalue_kc: pvalue,
+        p_log2err_kc: p_log2err,
         qvalue_kc: qvalue,
         cell_annotation_nc: posterior,
         argmax_labels: labels,

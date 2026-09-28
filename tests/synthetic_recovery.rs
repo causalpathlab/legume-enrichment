@@ -128,6 +128,8 @@ fn synthetic_three_blocks_recovered() {
         stratify_null: true,
         // The point-estimate path: this test is the no-regression guard for it.
         bootstrap: None,
+        multilevel: Some(enrichment::fgsea::Multilevel::default()),
+        type_tree: None,
     };
 
     let AnnotateOutputs {

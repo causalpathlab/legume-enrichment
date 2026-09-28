@@ -44,7 +44,7 @@
 //!
 //! If the null tracked none of the three, small panels and well-expressed panels would get
 //! systematically inflated `es_std` and the bootstrap would **manufacture the very winner's curse
-//! it exists to remove**. So [`null_moments`] scatters *the draw's own weight multiset* onto a
+//! it exists to remove**. So `null_moments` scatters *the draw's own weight multiset* onto a
 //! random gene set of *the draw's own size* drawn *within the draw's own abundance strata*. The
 //! `the_null_tracks_*` tests are the regression guards, and they are the reason that function
 //! exists.

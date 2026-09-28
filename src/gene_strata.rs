@@ -65,15 +65,15 @@ pub struct GeneStrata {
 }
 
 impl GeneStrata {
-    /// Bin every gene into at most [`N_STRATA`] equal-count bins of increasing abundance
+    /// Bin every gene into at most `N_STRATA` equal-count bins of increasing abundance
     /// (`Σ_k profile[g, k]`).
     ///
     /// Equal-count (quantile) bins rather than equal-width: expression is heavy-tailed, so
     /// equal-width bins would put almost every gene in the bottom bin and leave the top bin with
     /// nothing to swap a highly-expressed marker with.
     ///
-    /// [`N_STRATA`] is a ceiling, not a target: the count is reduced until every bin holds at least
-    /// [`MIN_PER_STRATUM`] genes, so a tiny gene pool gets few bins (and, in the limit, one — an
+    /// `N_STRATA` is a ceiling, not a target: the count is reduced until every bin holds at least
+    /// `MIN_PER_STRATUM` genes, so a tiny gene pool gets few bins (and, in the limit, one — an
     /// unstratified draw) rather than a null that cannot move.
     #[must_use]
     pub fn by_abundance(profile_gk: &Mat) -> Self {
@@ -121,6 +121,18 @@ impl GeneStrata {
     #[must_use]
     pub fn n_strata(&self) -> usize {
         self.members.len()
+    }
+
+    /// The bin gene `g` falls in.
+    #[must_use]
+    pub fn stratum_of(&self, g: u32) -> usize {
+        self.stratum[g as usize]
+    }
+
+    /// The genes in bin `s`.
+    #[must_use]
+    pub fn members(&self, s: usize) -> &[u32] {
+        &self.members[s]
     }
 
     /// A panel's **stratum profile**: `out[s]` holds the weights of the panel's genes that fall in
