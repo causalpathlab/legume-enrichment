@@ -1,6 +1,6 @@
 [package]
 name = "legume-enrichment"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -33,4 +33,4 @@ indicatif = { version = "^0.18", features = ["rayon"] }
 special = "0.13"
 statrs = { version = "0.18", default-features = false }
 
-legume-numeric = { version = "0.8.14", default-features = false, features = ["matrix"] }
+legume-numeric = { version = "0.9", default-features = false, features = ["matrix"] }
