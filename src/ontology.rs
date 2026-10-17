@@ -59,29 +59,47 @@ fn norm_sf(z: f64) -> f64 {
     (0.5 * (z / std::f64::consts::SQRT_2).compl_error()).clamp(1e-12, 1.0)
 }
 
-/// Parse a `label<TAB>id` TSV (flexible delimiter; `#` comments; a header row
-/// whose second column fails `id_ok` is skipped). `id_ok` validates the id
-/// column (e.g. starts with `CL:`), so a header line is dropped silently.
+/// Parse a `label<TAB>id` TSV. A line with a tab (trailing whitespace
+/// aside) splits on its tabs only, so a label keeps its commas
+/// (`CD4-positive, alpha-beta T cell`); a line without one splits on its
+/// commas. Cells keep their columns, each trimmed and unquoted: a row with an
+/// empty label or id is skipped (one warning gives the count). A first cell
+/// starting with `#` or `%` is a comment; a row whose id fails `id_ok` (a
+/// header) is dropped silently. A line that cannot be read is an error naming
+/// it. Labels are kept as written.
 pub fn parse_label_map(
     path: &str,
     id_ok: impl Fn(&str) -> bool,
 ) -> Result<FxHashMap<Box<str>, Box<str>>> {
-    let text = std::fs::read_to_string(path)
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)
         .map_err(|e| anyhow!("failed to read label→id map {path}: {e}"))?;
+    let unquote = |c: &str| {
+        let c = c.trim();
+        c.strip_prefix('"')
+            .and_then(|c| c.strip_suffix('"'))
+            .unwrap_or(c)
+            .to_string()
+    };
     let mut map: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let mut skipped = 0usize;
+    for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| anyhow!("{path}: line {}: {e}", i + 1))?;
+        let line = line.trim_end();
+        let cells: Vec<String> = line
+            .split(if line.contains('\t') { '\t' } else { ',' })
+            .map(unquote)
+            .collect();
+        let first = cells.first().map_or("", String::as_str);
+        if line.trim().is_empty() || first.starts_with('#') || first.starts_with('%') {
             continue;
         }
-        // Split on TAB/comma only — NOT space: cell-type labels may contain
-        // spaces (e.g. "CD4 T cell"), which must match the marker-file column.
-        let mut it = line
-            .split(['\t', ','])
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let (Some(label), Some(id)) = (it.next(), it.next()) else {
-            continue;
+        let (label, id) = match (cells.first(), cells.get(1)) {
+            (Some(l), Some(id)) if !l.is_empty() && !id.is_empty() => (l.as_str(), id.as_str()),
+            _ => {
+                skipped += 1;
+                continue;
+            }
         };
         if !id_ok(id) {
             continue; // header or malformed
@@ -94,6 +112,9 @@ pub fn parse_label_map(
             }
         }
         map.insert(label.into(), id.into());
+    }
+    if skipped > 0 {
+        log::warn!("{path}: skipped {skipped} row(s) with an empty label or id");
     }
     if map.is_empty() {
         return Err(anyhow!("no `label<TAB>id` rows parsed from {path}"));
