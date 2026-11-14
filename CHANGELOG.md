@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.3
+
+- `legume-numeric` is required as `>=0.9.5, <0.11`, so a dependent keeps the
+  single copy it already resolves, on 0.9 or 0.10. No API change.
+- Test fixtures and doc examples use neutral cell type labels and ids.
+
 ## 0.4.1
 
 Additive only.

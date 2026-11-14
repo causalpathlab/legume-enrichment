@@ -173,7 +173,7 @@ pub fn summarize_consensus(
         // **The set is over TYPES, not over the `unassigned` column** — but the shares are still
         // shares of *all* the replicates, so the `unassigned` mass stays in the denominator and
         // pushes the set toward not reaching coverage. An item whose replicates mostly declined to
-        // call it therefore gets no call, rather than the nonsense set `Erythroid/unassigned`.
+        // call it therefore gets no call, rather than the nonsense set `CT1/unassigned`.
         let set = credible_set(&row[..c], cfg.set_coverage, cfg.max_set_size).unwrap_or_default();
         set_support[i] = set.iter().map(|&t| row[t]).sum::<f32>().max(0.0);
         label_set.push(set);

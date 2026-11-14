@@ -124,7 +124,7 @@ pub fn descend(children: &[Vec<usize>], root: usize, cp: &[f64], q: f64, by: boo
 
 /// A hypothesis tree over cell types for [`treebh_q`]: `children` per node, the `root`, and each
 /// cell type's leaf. A leaf carries its type's p-value and must have no children; a type that is
-/// also a coarser node (say `T cells` over `CD4 T cells`) gets its own leaf *under* that node, as
+/// also a coarser node (say `CT1` over `CT1a`) gets its own leaf *under* that node, as
 /// in the tests' augmented tree.
 #[derive(Debug, Clone)]
 pub struct TypeTree {

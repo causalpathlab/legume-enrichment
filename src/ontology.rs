@@ -13,7 +13,7 @@
 //!   2. build the sub-DAG induced by those leaf ids (reduced to a tree by
 //!      keeping each node's most-specific induced parent), and augment every
 //!      labelled node with a `:self` leaf carrying its own z so internal-level
-//!      signal (e.g. generic "T") is not lost;
+//!      signal (e.g. a generic parent type) is not lost;
 //!   3. per unit: leaf p = Φ(−z), Simes-combine bottom-up, run TreeBH top-down;
 //!      the deepest rejected label = the assignment, "no rejected child" =
 //!      abstention, "nothing rejected" = `cannot_explain`.
@@ -61,7 +61,7 @@ fn norm_sf(z: f64) -> f64 {
 
 /// Parse a `label<TAB>id` table by legume-numeric's two-column rule
 /// ([`read_two_field_rows`](legume_numeric::matrix::common_io::read_two_field_rows)): a line with a tab splits on its tabs only, so a
-/// label keeps its commas (`CD4-positive, alpha-beta T cell`); one without is
+/// label keeps its commas (`CT1, subtype A`); one without is
 /// CSV, where a quoted label keeps its commas too. It may be gzipped. Cells
 /// keep their columns, trimmed and unquoted; blank lines and `#`/`%` comments
 /// are skipped. A row with an empty label or id is skipped, and one warning
@@ -132,7 +132,7 @@ impl TreeModel {
     /// Build the **collapsed label tree**: nodes are the marker labels
     /// themselves (each label's parent = its nearest *labelled* ancestor),
     /// plus a `:self` leaf per label carrying its own evidence. Generic Steiner
-    /// ancestors (lymphocyte, leukocyte, …) and dead cross-cutting axes are
+    /// ancestors (the broadest parent types, …) and dead cross-cutting axes are
     /// dropped — they only add depth and dilute the bottom-up Simes, and the
     /// resolvable abstention levels are the labels we actually have markers for.
     fn build(
@@ -618,7 +618,7 @@ mod label_map_tests {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("map.tsv");
         std::fs::write(&path, text)?;
-        let map = parse_label_map(path.to_str().unwrap(), |id| id.starts_with("CL:"))?;
+        let map = parse_label_map(path.to_str().unwrap(), |id| id.starts_with("ID:"))?;
         let mut v: Vec<(String, String)> = map
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -631,18 +631,15 @@ mod label_map_tests {
     fn a_tab_separated_label_keeps_its_commas_and_a_comma_line_still_splits() {
         let v = map_of(
             "commas",
-            "label\tcl\nCD4-positive, alpha-beta T cell\tCL:0000624\nB cell,CL:0000236\nNK cell\tCL:0000623\t\n",
+            "label\tcl\nCT1, subtype A\tID:0000001\nCT2,ID:0000002\nCT3\tID:0000003\t\n",
         )
         .unwrap();
         assert_eq!(
             v,
             [
-                ("B cell".into(), "CL:0000236".into()),
-                (
-                    "CD4-positive, alpha-beta T cell".into(),
-                    "CL:0000624".into()
-                ),
-                ("NK cell".into(), "CL:0000623".into()),
+                ("CT1, subtype A".into(), "ID:0000001".into()),
+                ("CT2".into(), "ID:0000002".into()),
+                ("CT3".into(), "ID:0000003".into()),
             ]
         );
     }
@@ -651,14 +648,14 @@ mod label_map_tests {
     fn cells_keep_their_columns_and_quotes_and_comments_go() {
         let v = map_of(
             "columns",
-            "Mono\t\tCL:0000576\n\tCL:0000084\n\"T cell\"\t\"CL:0000084\"\n  # note\n%x\tCL:1\nDC\tCL:0000451\n",
+            "CT5\t\tID:0000005\n\tID:0000004\n\"CT4\"\t\"ID:0000004\"\n  # note\n%x\tID:1\nCT6\tID:0000006\n",
         )
         .unwrap();
         assert_eq!(
             v,
             [
-                ("DC".into(), "CL:0000451".into()),
-                ("T cell".into(), "CL:0000084".into()),
+                ("CT4".into(), "ID:0000004".into()),
+                ("CT6".into(), "ID:0000006".into()),
             ],
             "an empty cell skips its row rather than shifting the next one in"
         );
@@ -666,20 +663,14 @@ mod label_map_tests {
 
     #[test]
     fn single_quoted_cells_are_unquoted_too() {
-        let v = map_of("single", "'T cell'\t'CL:0000084'\n").unwrap();
-        assert_eq!(v, [("T cell".into(), "CL:0000084".into())]);
+        let v = map_of("single", "'CT4'\t'ID:0000004'\n").unwrap();
+        assert_eq!(v, [("CT4".into(), "ID:0000004".into())]);
     }
 
     #[test]
     fn a_quoted_csv_label_keeps_its_comma() {
-        let v = map_of("quoted", "\"CD4-positive, alpha-beta T cell\",CL:0000624\n").unwrap();
-        assert_eq!(
-            v,
-            [(
-                "CD4-positive, alpha-beta T cell".into(),
-                "CL:0000624".into()
-            )]
-        );
+        let v = map_of("quoted", "\"CT1, subtype A\",ID:0000001\n").unwrap();
+        assert_eq!(v, [("CT1, subtype A".into(), "ID:0000001".into())]);
     }
 
     #[test]
@@ -687,8 +678,8 @@ mod label_map_tests {
         let dir = std::env::temp_dir().join(format!("label-map-utf8-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("map.tsv");
-        std::fs::write(&path, b"DC\tCL:0000451\nX\t\xff\xfe\n").unwrap();
-        let err = parse_label_map(path.to_str().unwrap(), |id| id.starts_with("CL:")).unwrap_err();
+        std::fs::write(&path, b"DC\tID:0000006\nX\t\xff\xfe\n").unwrap();
+        let err = parse_label_map(path.to_str().unwrap(), |id| id.starts_with("ID:")).unwrap_err();
         let err = format!("{err:#}");
         assert!(err.contains("map.tsv: line 2"), "{err}");
     }
