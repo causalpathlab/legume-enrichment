@@ -24,6 +24,18 @@ jobs:
       - run: cargo test --release
       - run: cargo doc --no-deps
 
+  lowest-numeric:
+    # the oldest legume-numeric the requirement admits, so dependents on it
+    # are not broken by a newer-only call
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo generate-lockfile
+      - run: cargo update -p legume-numeric --precise 0.9.5
+      - run: cargo test --release
+
   msrv:
     runs-on: ubuntu-latest
     steps:

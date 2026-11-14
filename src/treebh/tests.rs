@@ -2,17 +2,17 @@
 
 use super::*;
 
-/// Augmented tree mirroring an internal "T" label with CD8/CD4 children:
-///   0 root → 1 A("T") → {2 A_self, 3 B_node("CD8")→4 B_self, 5 C_node("CD4")→6 C_self}
+/// Augmented tree mirroring an internal "CT1" label with CT1a/CT1b children:
+///   0 root → 1 A("CT1") → {2 A_self, 3 B_node("CT1a")→4 B_self, 5 C_node("CT1b")→6 C_self}
 /// leaves (carrying data p) are the *_self nodes 2/4/6.
 fn tree() -> (Vec<Vec<usize>>, Vec<usize>) {
     let children = vec![
         vec![1],       // 0 root
         vec![2, 3, 5], // 1 A (T)
         vec![],        // 2 A_self
-        vec![4],       // 3 B_node (CD8)
+        vec![4],       // 3 B_node (CT1a)
         vec![],        // 4 B_self
-        vec![6],       // 5 C_node (CD4)
+        vec![6],       // 5 C_node (CT1b)
         vec![],        // 6 C_self
     ];
     let postorder = vec![2, 4, 3, 6, 5, 1, 0];
@@ -31,16 +31,16 @@ fn run(p_tself: f64, p_cd8: f64, p_cd4: f64) -> Vec<bool> {
 
 #[test]
 fn peaked_subtype_descends() {
-    // Generic-T present AND CD8 strong, CD4 absent → resolve to CD8.
+    // Generic CT1 present AND CT1a strong, CT1b absent → resolve to CT1a.
     let r = run(0.001, 0.001, 0.9);
-    assert!(r[4], "CD8 self should be rejected");
-    assert!(!r[6], "CD4 self should NOT be rejected");
+    assert!(r[4], "CT1a self should be rejected");
+    assert!(!r[6], "CT1b self should NOT be rejected");
     assert!(r[2], "T self rejected");
 }
 
 #[test]
 fn flat_siblings_stop_at_parent() {
-    // Generic-T strong but CD8≈CD4 weak → resolve to T, abstain on subtype.
+    // Generic CT1 strong but CT1a ≈ CT1b weak → resolve to CT1, abstain on subtype.
     let r = run(0.001, 0.2, 0.2);
     assert!(r[2], "T self rejected (resolved at T)");
     assert!(!r[4] && !r[6], "neither subtype rejected (abstain)");
@@ -84,7 +84,7 @@ fn a_tree_q_is_the_smallest_target_that_rejects() {
     assert!(q[4] > q[2], "a subtype is gated by its parent family");
     assert!(
         q[6] >= 0.9 - 1e-9,
-        "CD4 (p 0.9) is rejected only at a target that high: {}",
+        "CT1b (p 0.9) is rejected only at a target that high: {}",
         q[6]
     );
 }
